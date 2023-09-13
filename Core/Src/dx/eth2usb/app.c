@@ -13,6 +13,9 @@
 #include "settings.h"
 #include "main.h"
 
+// TODO: Figure out why read() can return -1 with errno 0. For now this weird behavior
+//  won't cause trouble, since my code will ignore errno 0 (dirty hack!).
+
 extern USBH_HandleTypeDef hUsbHostHS;
 extern bool DX_USBH_IsDeviceConnected;
 
@@ -49,7 +52,7 @@ static void DX_ETH2USB_App_Init_ThreadAttrs(DX_ETH2USB_AppState_t *app) {
 
 	app->statusThreadAttr.name = "DX_ETH2USB_App_StatusThread";
 	app->statusThreadAttr.stack_size = 256;
-	app->statusThreadAttr.priority = osPriorityLow;
+	app->statusThreadAttr.priority = osPriorityNormal;
 }
 
 static void DX_ETH2USB_App_Init_Threads(DX_ETH2USB_AppState_t *app) {
@@ -77,6 +80,7 @@ static void DX_ETH2USB_App_Init_ThreadStates_EthThread_Client(
 	DX_ETH2USB_App_EthThread_ClientState_t *client = &ethThreadState->client;
 
 	client->fd = -1;
+	client->connected = false;
 
 	memset(&client->addr, 0, sizeof(struct sockaddr_in));
 }
@@ -110,6 +114,8 @@ static void DX_ETH2USB_App_Init_ThreadStates(DX_ETH2USB_AppState_t *app) {
 }
 
 void DX_ETH2USB_App_Init(DX_ETH2USB_AppState_t *app) {
+	mlog("Initializing app");
+
 	DX_ETH2USB_App_Init_CreateMemPools(app);
 	DX_ETH2USB_App_Init_CreateMsgQueues(app);
 	DX_ETH2USB_App_Init_ThreadAttrs(app);
@@ -128,7 +134,7 @@ static void DX_ETH2USB_App_EthThread_InitializeWritingOfFrame(
 		return;
 
 	status = osMessageQueueGet(app->usb2ethMsgQueueId,
-			&threadState->outgoingFrame, NULL, 0U);
+			&threadState->outgoingFrame, NULL, osWaitForever);
 	if (status != osOK)
 		Error_Handler();
 
@@ -148,6 +154,9 @@ static void DX_ETH2USB_App_EthThread_CloseClientSocket(
 				strerror(errno));
 		Error_Handler();
 	}
+
+	client->fd = -1;
+	client->connected = false;
 }
 
 static void DX_ETH2USB_App_EthThread_WriteOutgoingFrame_HandleSuccess(
@@ -181,7 +190,7 @@ static void DX_ETH2USB_App_EthThread_WriteOutgoingFrame_EndOfStream(
 
 static void DX_ETH2USB_App_EthThread_WriteOutgoingFrame_HandleError(
 		DX_ETH2USB_AppState_t *app) {
-	if (errno == EAGAIN)
+	if (errno == EAGAIN || errno == 0)
 		return;
 	else if (errno == ECONNRESET) {
 		mlog("Connection got closed while writing frame");
@@ -209,7 +218,7 @@ static void DX_ETH2USB_App_EthThread_WriteOutgoingFrame(
 		DX_ETH2USB_App_EthThread_WriteOutgoingFrame_HandleSuccess(app, ret);
 	} else if (ret == 0) {
 		DX_ETH2USB_App_EthThread_WriteOutgoingFrame_EndOfStream(app);
-	} else {
+	} else if (ret == -1) {
 		DX_ETH2USB_App_EthThread_WriteOutgoingFrame_HandleError(app);
 	}
 }
@@ -220,7 +229,7 @@ static void DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleSuccess_ForwardFra
 	osStatus_t status = osOK;
 
 	status = osMessageQueuePut(app->eth2usbMsgQueueId,
-			&threadState->incommingFrame, 0U, 0U);
+			&threadState->incommingFrame, 0U, osWaitForever);
 	if (status != osOK) {
 		Error_Handler();
 	}
@@ -229,12 +238,13 @@ static void DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleSuccess_ForwardFra
 }
 
 static void DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleSuccess(
-		DX_ETH2USB_AppState_t *app, uint32_t nBytesToRead) {
+		DX_ETH2USB_AppState_t *app, uint32_t nBytesToRead, int32_t ret) {
 	DX_ETH2USB_App_EthThreadState_t *threadState = &app->ethThreadState;
 	DX_ETH2USB_ETHFrame_t *frame = threadState->incommingFrame;
 
-	mlog("Read %u bytes out of the %u bytes", threadState->nBytesRead,
-			nBytesToRead);
+	threadState->nBytesRead += (uint32_t) ret;
+
+	mlog("Read %u bytes out of the %u bytes", ret, nBytesToRead);
 
 	if (threadState->nBytesRead == 4) {
 		if (frame->payloadSize == 0) {
@@ -263,7 +273,8 @@ static void DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleEndOfStream(
 
 static void DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleError(
 		DX_ETH2USB_AppState_t *app) {
-	if (errno == EAGAIN)
+
+	if (errno == EAGAIN || errno == 0)
 		return;
 	else if (errno == ECONNRESET) {
 		mlog("Remote closed stream while reading incomming frame");
@@ -309,10 +320,10 @@ static void DX_ETH2USB_App_EthThread_ReadIncommingFrame(
 	ret = read(client->fd, bytes, nBytesToRead);
 
 	if (ret > 0) {
-		DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleSuccess(app, ret);
+		DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleSuccess(app, nBytesToRead, ret);
 	} else if (ret == 0) {
 		DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleEndOfStream(app);
-	} else {
+	} else if (ret == -1) {
 		DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleError(app);
 	}
 }
@@ -382,6 +393,10 @@ static void DX_ETH2USB_App_EthThread_AcceptClientSocket(
 
 	mlog("Accepted client socket %s:%u", inet_ntoa(client->addr),
 			ntohs(client->addr.sin_port));
+
+	threadState->nBytesRead = 0U;
+
+	client->connected = true;
 }
 
 static void DX_ETH2USB_App_EthThread(void *arg) {
@@ -408,6 +423,8 @@ static void DX_ETH2USB_App_EthThread(void *arg) {
 			DX_ETH2USB_App_EthThread_StartReadingIncommingFrame(app);
 		if (threadState->incommingFrame != NULL)
 			DX_ETH2USB_App_EthThread_ReadIncommingFrame(app);
+
+		osDelay(1);
 	}
 }
 
@@ -417,7 +434,7 @@ static void DX_ETH2USB_App_UsbThread_GetEthFrame(DX_ETH2USB_AppState_t *app) {
 	osStatus_t status = osOK;
 
 	status = osMessageQueueGet(app->eth2usbMsgQueueId, &threadState->frame,
-			NULL, 0U);
+			NULL, osWaitForever);
 	if (status != osOK)
 		Error_Handler();
 }
@@ -428,43 +445,11 @@ static void DX_ETH2USB_App_UsbThread_PutEthFrame(DX_ETH2USB_AppState_t *app) {
 	DX_ETH2USB_App_UsbThreadState_t *threadState = &app->usbThreadState;
 	osStatus status = osOK;
 
-	status = osMessageQueuePut(app->eth2usbMsgQueueId, &threadState->frame, 0U,
-			0U);
+	status = osMessageQueuePut(app->usb2ethMsgQueueId, &threadState->frame, 0U,
+			osWaitForever);
 	if (status != osOK)
 		Error_Handler();
 
-}
-
-static void DX_ETH2USB_App_UsbThread_WriteFrame(DX_ETH2USB_AppState_t *app) {
-	DX_ETH2USB_App_UsbThreadState_t *threadState = &app->usbThreadState;
-	DX_ETH2USB_ETHFrame_t *ethFrame = threadState->frame;
-	USBH_StatusTypeDef status = USBH_OK;
-
-	while ((status = USBH_BulkSendData(&hUsbHostHS, ethFrame->payload,
-			ethFrame->payloadSize, DX_ETH2USB__USB_DEVICE__PRIMARY_PIPE_NO,
-			false)) == USBH_BUSY)
-		osDelay(1);
-
-	if (status != USBH_OK) {
-		mlog("Failed to send bulk data");
-		Error_Handler();
-	}
-}
-
-static void DX_ETH2USB_App_UsbThread_ReadFrame(DX_ETH2USB_AppState_t *app) {
-	DX_ETH2USB_App_UsbThreadState_t *threadState = &app->usbThreadState;
-	DX_ETH2USB_ETHFrame_t *ethFrame = threadState->frame;
-	USBH_StatusTypeDef status = USBH_OK;
-
-	while ((status = USBH_BulkReceiveData(&hUsbHostHS, ethFrame->payload,
-	DX_ETH2USB_ETHFRAME_MAX_PAYLOAD_SIZE,
-	DX_ETH2USB__USB_DEVICE__PRIMARY_PIPE_NO)) == USBH_BUSY)
-		osDelay(1);
-
-	if (status != USBH_OK) {
-		mlog("Failed to read bulk data");
-		Error_Handler();
-	}
 }
 
 /// The thread that forwards frames to the USB device.
@@ -481,10 +466,9 @@ static void DX_ETH2USB_App_UsbThread(void *arg) {
 				"of size %u to transmit to USB",
 				threadState->frame->payloadSize);
 
-		DX_ETH2USB_App_UsbThread_WriteFrame(app);
-		DX_ETH2USB_App_UsbThread_ReadFrame(app);
-
 		DX_ETH2USB_App_UsbThread_PutEthFrame(app);
+
+		osDelay(1);
 	}
 }
 
@@ -494,7 +478,7 @@ static void DX_ETH2USB_App_StatusThread_UpdateEthStatus(
 	DX_ETH2USB_App_StatusThreadState_t *state = &app->statusThreadState;
 	uint32_t currentTick = HAL_GetTick();
 
-	const bool isEthConnected = (app->ethThreadState.client.fd == -1);
+	const bool isEthConnected = app->ethThreadState.client.connected;
 
 	if (!isEthConnected && state->wasEthConnected) {
 		HAL_GPIO_WritePin(LED_YELLOW_GPIO_Port, LED_YELLOW_Pin, GPIO_PIN_RESET);
@@ -520,7 +504,7 @@ static void DX_ETH2USB_App_StatusThread_UpdateUsbStatus(
 	DX_ETH2USB_App_StatusThreadState_t *state = &app->statusThreadState;
 	uint32_t currentTick = HAL_GetTick();
 
-	bool isUsbConnected = DX_USBH_IsDeviceConnected;
+	const bool isUsbConnected = DX_USBH_IsDeviceConnected;
 
 	if (!isUsbConnected && state->wasUsbConnected) {
 		HAL_GPIO_WritePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin, GPIO_PIN_RESET);
@@ -552,6 +536,8 @@ static void DX_ETH2USB_App_StatusThread(void *arg) {
 }
 
 void DX_ETH2USB_App_Start(DX_ETH2USB_AppState_t *app) {
+	mlog("Starting app");
+
 	app->ethThreadId = osThreadNew(DX_ETH2USB_App_EthThread, app,
 			&app->ethThreadAttr);
 	if (app->ethThreadId == NULL)

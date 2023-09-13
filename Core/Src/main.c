@@ -92,8 +92,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
 int __io_putchar(int value) {
 	HAL_StatusTypeDef hal_status = HAL_OK;
 
-	hal_status = HAL_UART_Transmit(&huart3, (uint8_t*) &value, sizeof(char),
-			0xFFFF);
+	while((hal_status = HAL_UART_Transmit(&huart3, (uint8_t*) &value, sizeof(char),
+			0xFFFF)) == HAL_BUSY);
 
 	if (hal_status != HAL_OK) {
 		Error_Handler();

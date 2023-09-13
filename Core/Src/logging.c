@@ -15,6 +15,8 @@
 extern RTC_HandleTypeDef hrtc;
 
 void _mlog(const char *function, const int line, const char *fmt, ...) {
+	__disable_irq();
+
 	RTC_TimeTypeDef current_time;
 	RTC_DateTypeDef current_date;
 
@@ -34,4 +36,6 @@ void _mlog(const char *function, const int line, const char *fmt, ...) {
 	va_end(args);
 
 	printf("\r\n");
+
+	__enable_irq();
 }

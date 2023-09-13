@@ -35,6 +35,7 @@ typedef struct {
 	int32_t fd;
 	struct sockaddr_in addr;
 	socklen_t socklen;
+	bool connected;
 } DX_ETH2USB_App_EthThread_ClientState_t;
 
 typedef struct {
