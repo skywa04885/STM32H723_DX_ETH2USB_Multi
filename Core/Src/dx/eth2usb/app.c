@@ -8,6 +8,7 @@
 #include <string.h>
 #include <usbh_core.h>
 
+#include "dx/eth2usb/active_servo_class.h"
 #include "dx/eth2usb/app.h"
 #include "logging.h"
 #include "settings.h"
@@ -20,24 +21,29 @@ extern USBH_HandleTypeDef hUsbHostHS;
 extern bool DX_USBH_IsDeviceConnected;
 
 void DX_ETH2USB_App_Init_CreateMemPools(DX_ETH2USB_AppState_t *app) {
-	app->ethFrameMemPoolId = osMemoryPoolNew(
-	DX_ETH2USB_APP_ETH_FRAME_MEM_POOL_SIZE, sizeof(DX_ETH2USB_ETHFrame_t),
+	app->commandMemPoolId = osMemoryPoolNew(
+	DX_ETH2USB__APP__COMMAND_MEM_POOL_SIZE, sizeof(DX_ETH2USB_Command_t), NULL);
+	if (app->commandMemPoolId == NULL)
+		Error_Handler();
+
+	app->responseMemPoolId = osMemoryPoolNew(
+	DX_ETH2USB__APP__RESPONSE_MEM_POOL_SIZE, sizeof(DX_ETH2USB_Response_t),
 	NULL);
-	if (app->ethFrameMemPoolId == NULL)
+	if (app->responseMemPoolId == NULL)
 		Error_Handler();
 }
 
 void DX_ETH2USB_App_Init_CreateMsgQueues(DX_ETH2USB_AppState_t *app) {
-	app->eth2usbMsgQueueId = osMessageQueueNew(
-	DX_ETH2USB_APP_ETH2USB_MSG_QUEUE_SIZE, sizeof(DX_ETH2USB_ETHFrame_t*),
+	app->commandMsgQueueId = osMessageQueueNew(
+	DX_ETH2USB__APP__COMMAND_MSG_QUEUE_SIZE, sizeof(DX_ETH2USB_Command_t*),
 	NULL);
-	if (app->eth2usbMsgQueueId == NULL)
+	if (app->commandMsgQueueId == NULL)
 		Error_Handler();
 
-	app->usb2ethMsgQueueId = osMessageQueueNew(
-	DX_ETH2USB_APP_USB2ETH_MSG_QUEUE_SIZE, sizeof(DX_ETH2USB_ETHFrame_t*),
+	app->responseMsgQueueId = osMessageQueueNew(
+	DX_ETH2USB__APP__RESPONSE_MSG_QUEUE_SIZE, sizeof(DX_ETH2USB_Response_t*),
 	NULL);
-	if (app->usb2ethMsgQueueId == NULL)
+	if (app->responseMsgQueueId == NULL)
 		Error_Handler();
 }
 
@@ -92,8 +98,8 @@ static void DX_ETH2USB_App_Init_ThreadStates_EthThread(
 	DX_ETH2USB_App_Init_ThreadStates_EthThread_Server(app);
 	DX_ETH2USB_App_Init_ThreadStates_EthThread_Client(app);
 
-	ethThreadState->incommingFrame = NULL;
-	ethThreadState->outgoingFrame = NULL;
+	ethThreadState->command = NULL;
+	ethThreadState->response = NULL;
 }
 
 static void DX_ETH2USB_App_Init_ThreadStates_StatusThread(
@@ -123,18 +129,18 @@ void DX_ETH2USB_App_Init(DX_ETH2USB_AppState_t *app) {
 	DX_ETH2USB_App_Init_ThreadStates(app);
 }
 
-static void DX_ETH2USB_App_EthThread_InitializeWritingOfFrame(
+static void DX_ETH2USB_App_EthThread_InitializeWritingOfResponse(
 		DX_ETH2USB_AppState_t *app) {
 	DX_ETH2USB_App_EthThreadState_t *threadState = &app->ethThreadState;
-	uint32_t ethFrameCount = 0;
+	uint32_t responseCount = 0;
 	osStatus_t status = osOK;
 
-	ethFrameCount = osMessageQueueGetCount(app->usb2ethMsgQueueId);
-	if (ethFrameCount == 0)
+	responseCount = osMessageQueueGetCount(app->responseMsgQueueId);
+	if (responseCount == 0)
 		return;
 
-	status = osMessageQueueGet(app->usb2ethMsgQueueId,
-			&threadState->outgoingFrame, NULL, osWaitForever);
+	status = osMessageQueueGet(app->responseMsgQueueId, &threadState->response,
+	NULL, osWaitForever);
 	if (status != osOK)
 		Error_Handler();
 
@@ -159,7 +165,7 @@ static void DX_ETH2USB_App_EthThread_CloseClientSocket(
 	client->connected = false;
 }
 
-static void DX_ETH2USB_App_EthThread_WriteOutgoingFrame_HandleSuccess(
+static void DX_ETH2USB_App_EthThread_WriteResponse_HandleSuccess(
 		DX_ETH2USB_AppState_t *app, int32_t ret) {
 	DX_ETH2USB_App_EthThreadState_t *threadState = &app->ethThreadState;
 	osStatus status = osOK;
@@ -167,164 +173,147 @@ static void DX_ETH2USB_App_EthThread_WriteOutgoingFrame_HandleSuccess(
 	threadState->nBytesWritten += (uint32_t) ret;
 
 	mlog("Wrote %u out of %u bytes", threadState->nBytesWritten,
-			threadState->outgoingFrame->payloadSize + sizeof(uint32_t));
+			sizeof(DX_ETH2USB_Response_t));
 
-	if (threadState->nBytesWritten
-			< threadState->outgoingFrame->payloadSize + sizeof(uint32_t))
+	if (threadState->nBytesWritten < sizeof(DX_ETH2USB_Response_t))
 		return;
 
-	status = osMemoryPoolFree(app->ethFrameMemPoolId,
-			threadState->outgoingFrame);
-	if (status != osOK)
+	status = osMemoryPoolFree(app->responseMemPoolId, threadState->response);
+	if (status != osOK) {
+		mlog("Failed to free response, status: %d", status);
 		Error_Handler();
+	}
 
-	threadState->outgoingFrame = NULL;
+	threadState->response = NULL;
 }
 
-static void DX_ETH2USB_App_EthThread_WriteOutgoingFrame_EndOfStream(
+static void DX_ETH2USB_App_EthThread_WriteResponse_EndOfStream(
 		DX_ETH2USB_AppState_t *app) {
-	mlog("Received EOS while writing frame");
+	mlog("Received EOS while writing response");
 
 	DX_ETH2USB_App_EthThread_CloseClientSocket(app);
 }
 
-static void DX_ETH2USB_App_EthThread_WriteOutgoingFrame_HandleError(
+static void DX_ETH2USB_App_EthThread_WriteResponse_HandleError(
 		DX_ETH2USB_AppState_t *app) {
 	if (errno == EAGAIN || errno == 0)
 		return;
 	else if (errno == ECONNRESET) {
-		mlog("Connection got closed while writing frame");
+		mlog("Connection got closed while writing response");
 		DX_ETH2USB_App_EthThread_CloseClientSocket(app);
 	} else {
-		mlog("Failed to write frame, error (%d): %s", errno, strerror(errno));
+		mlog("Failed to write response, error (%d): %s", errno, strerror(errno));
 		Error_Handler();
 	}
 }
 
-static void DX_ETH2USB_App_EthThread_WriteOutgoingFrame(
+static void DX_ETH2USB_App_EthThread_WriteResponse(
 		DX_ETH2USB_AppState_t *app) {
 	DX_ETH2USB_App_EthThreadState_t *threadState = &app->ethThreadState;
 	DX_ETH2USB_App_EthThread_ClientState_t *client = &threadState->client;
 	int32_t ret = -1;
 
 	const uint8_t *bytes =
-			&((uint8_t*) threadState->outgoingFrame)[threadState->nBytesWritten];
-	const uint32_t bytesToWrite = threadState->outgoingFrame->payloadSize
-			+ sizeof(uint32_t) - threadState->nBytesWritten;
+			&((uint8_t*) threadState->response)[threadState->nBytesWritten];
+	const uint32_t bytesToWrite = sizeof(DX_ETH2USB_Response_t)
+			- threadState->nBytesWritten;
 
 	ret = write(client->fd, bytes, bytesToWrite);
 
 	if (ret > 0) {
-		DX_ETH2USB_App_EthThread_WriteOutgoingFrame_HandleSuccess(app, ret);
+		DX_ETH2USB_App_EthThread_WriteResponse_HandleSuccess(app, ret);
 	} else if (ret == 0) {
-		DX_ETH2USB_App_EthThread_WriteOutgoingFrame_EndOfStream(app);
+		DX_ETH2USB_App_EthThread_WriteResponse_EndOfStream(app);
 	} else if (ret == -1) {
-		DX_ETH2USB_App_EthThread_WriteOutgoingFrame_HandleError(app);
+		DX_ETH2USB_App_EthThread_WriteResponse_HandleError(app);
 	}
 }
 
-static void DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleSuccess_ForwardFrameToUSB(
+static void DX_ETH2USB_App_EthThread_ReadCommand_HandleSuccess_ForwardToUSB(
 		DX_ETH2USB_AppState_t *app) {
 	DX_ETH2USB_App_EthThreadState_t *threadState = &app->ethThreadState;
 	osStatus_t status = osOK;
 
-	status = osMessageQueuePut(app->eth2usbMsgQueueId,
-			&threadState->incommingFrame, 0U, osWaitForever);
+	status = osMessageQueuePut(app->commandMsgQueueId, &threadState->command,
+			0U, osWaitForever);
 	if (status != osOK) {
 		Error_Handler();
 	}
 
-	threadState->incommingFrame = NULL;
+	threadState->command = NULL;
 }
 
-static void DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleSuccess(
-		DX_ETH2USB_AppState_t *app, uint32_t nBytesToRead, int32_t ret) {
+static void DX_ETH2USB_App_EthThread_ReadCommand_HandleSuccess(
+		DX_ETH2USB_AppState_t *app, int32_t ret) {
 	DX_ETH2USB_App_EthThreadState_t *threadState = &app->ethThreadState;
-	DX_ETH2USB_ETHFrame_t *frame = threadState->incommingFrame;
 
 	threadState->nBytesRead += (uint32_t) ret;
 
-	mlog("Read %u bytes out of the %u bytes", ret, nBytesToRead);
+	mlog("Read %u bytes out of the %u bytes", ret,
+			sizeof(DX_ETH2USB_Command_t));
 
-	if (threadState->nBytesRead == 4) {
-		if (frame->payloadSize == 0) {
-			mlog("Got payload of size 0, this is not allowed.");
-			DX_ETH2USB_App_EthThread_CloseClientSocket(app);
-		} else if (frame->payloadSize > DX_ETH2USB_ETHFRAME_MAX_PAYLOAD_SIZE) {
-			mlog(
-					"Got payload of size %u which exceeds the max payload size of %u",
-					frame->payloadSize, DX_ETH2USB_ETHFRAME_MAX_PAYLOAD_SIZE);
-			DX_ETH2USB_App_EthThread_CloseClientSocket(app);
-		}
-	} else if (threadState->nBytesRead > 4
-			&& threadState->nBytesRead
-					>= frame->payloadSize + sizeof(uint32_t)) {
-		mlog("Received entire frame of size %u", threadState->nBytesRead);
-		DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleSuccess_ForwardFrameToUSB(
-				app);
-	}
+	if (threadState->nBytesRead < sizeof(DX_ETH2USB_Command_t))
+		return;
+
+	mlog("Received entire command of size %u", threadState->nBytesRead);
+
+	DX_ETH2USB_App_EthThread_ReadCommand_HandleSuccess_ForwardToUSB(
+			app);
 }
 
-static void DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleEndOfStream(
+static void DX_ETH2USB_App_EthThread_ReadCommand_HandleEndOfStream(
 		DX_ETH2USB_AppState_t *app) {
-	mlog("Received end of stream while reading incomming frame");
+	mlog("Received end of stream while reading incoming command");
+
 	DX_ETH2USB_App_EthThread_CloseClientSocket(app);
 }
 
-static void DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleError(
+static void DX_ETH2USB_App_EthThread_ReadCommand_HandleError(
 		DX_ETH2USB_AppState_t *app) {
 
 	if (errno == EAGAIN || errno == 0)
 		return;
 	else if (errno == ECONNRESET) {
-		mlog("Remote closed stream while reading incomming frame");
+		mlog("Remote closed stream while reading incoming command");
 		DX_ETH2USB_App_EthThread_CloseClientSocket(app);
 	} else {
-		mlog("Failed to read incoming frame, error (%d): %s", errno,
+		mlog("Failed to read incoming command, error (%d): %s", errno,
 				strerror(errno));
 		Error_Handler();
 	}
 }
 
-static void DX_ETH2USB_App_EthThread_StartReadingIncommingFrame(
+static void DX_ETH2USB_App_EthThread_StartReadingCommand(
 		DX_ETH2USB_AppState_t *app) {
 	DX_ETH2USB_App_EthThreadState_t *threadState = &app->ethThreadState;
 
-	if (osMemoryPoolGetSpace(app->ethFrameMemPoolId) == 0)
+	if (osMemoryPoolGetSpace(app->commandMemPoolId) == 0)
 		return;
 
-	threadState->incommingFrame = osMemoryPoolAlloc(app->ethFrameMemPoolId, 0U);
-	if (threadState->incommingFrame == NULL)
+	threadState->command = osMemoryPoolAlloc(app->commandMemPoolId, 0U);
+	if (threadState->command == NULL)
 		Error_Handler();
 
 	threadState->nBytesRead = 0;
 }
 
-static void DX_ETH2USB_App_EthThread_ReadIncommingFrame(
+static void DX_ETH2USB_App_EthThread_ReadCommand(
 		DX_ETH2USB_AppState_t *app) {
 	DX_ETH2USB_App_EthThreadState_t *threadState = &app->ethThreadState;
 	DX_ETH2USB_App_EthThread_ClientState_t *client = &threadState->client;
-	DX_ETH2USB_ETHFrame_t *frame = threadState->incommingFrame;
-	uint32_t nBytesToRead = 0;
 	int32_t ret = -1;
 
-	if (threadState->nBytesRead >= sizeof(uint32_t)) {
-		nBytesToRead = frame->payloadSize + sizeof(uint32_t)
-				- threadState->nBytesRead;
-	} else {
-		nBytesToRead = sizeof(uint32_t) - threadState->nBytesRead;
-	}
-
-	uint8_t *bytes = &((uint8_t*) frame)[threadState->nBytesRead];
+	const uint32_t nBytesToRead = sizeof(DX_ETH2USB_Command_t) - threadState->nBytesRead;
+	uint8_t *bytes = &((uint8_t*) threadState->command)[threadState->nBytesRead];
 
 	ret = read(client->fd, bytes, nBytesToRead);
 
 	if (ret > 0) {
-		DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleSuccess(app, nBytesToRead, ret);
+		DX_ETH2USB_App_EthThread_ReadCommand_HandleSuccess(app, ret);
 	} else if (ret == 0) {
-		DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleEndOfStream(app);
+		DX_ETH2USB_App_EthThread_ReadCommand_HandleEndOfStream(app);
 	} else if (ret == -1) {
-		DX_ETH2USB_App_EthThread_ReadIncommingFrame_HandleError(app);
+		DX_ETH2USB_App_EthThread_ReadCommand_HandleError(app);
 	}
 }
 
@@ -410,63 +399,82 @@ static void DX_ETH2USB_App_EthThread(void *arg) {
 		while (threadState->client.fd == -1)
 			DX_ETH2USB_App_EthThread_AcceptClientSocket(app);
 
-		if (threadState->outgoingFrame == NULL)
-			DX_ETH2USB_App_EthThread_InitializeWritingOfFrame(app);
+		if (threadState->response == NULL)
+			DX_ETH2USB_App_EthThread_InitializeWritingOfResponse(app);
 
-		if (threadState->outgoingFrame != NULL)
-			DX_ETH2USB_App_EthThread_WriteOutgoingFrame(app);
+		if (threadState->response != NULL)
+			DX_ETH2USB_App_EthThread_WriteResponse(app);
 
 		if (client->fd == -1)
 			continue;
 
-		if (threadState->incommingFrame == NULL)
-			DX_ETH2USB_App_EthThread_StartReadingIncommingFrame(app);
-		if (threadState->incommingFrame != NULL)
-			DX_ETH2USB_App_EthThread_ReadIncommingFrame(app);
+		if (threadState->command == NULL)
+			DX_ETH2USB_App_EthThread_StartReadingCommand(app);
+		if (threadState->command != NULL)
+			DX_ETH2USB_App_EthThread_ReadCommand(app);
 
 		osDelay(1);
 	}
 }
 
-/// Gets a single frame that the USB thread should forward to the USB device.
-static void DX_ETH2USB_App_UsbThread_GetEthFrame(DX_ETH2USB_AppState_t *app) {
+static void DX_ETH2USB_App_UsbThread_GetCommand(DX_ETH2USB_AppState_t *app) {
 	DX_ETH2USB_App_UsbThreadState_t *threadState = &app->usbThreadState;
 	osStatus_t status = osOK;
 
-	status = osMessageQueueGet(app->eth2usbMsgQueueId, &threadState->frame,
-			NULL, osWaitForever);
+	status = osMessageQueueGet(app->commandMsgQueueId, &threadState->command,
+	NULL, osWaitForever);
 	if (status != osOK)
 		Error_Handler();
 }
 
-/// Puts a single frame on the message queue for the ETH thread to forward to
-/// the ETH client.
-static void DX_ETH2USB_App_UsbThread_PutEthFrame(DX_ETH2USB_AppState_t *app) {
+static void DX_ETH2USB_App_UsbThread_PutResponse(DX_ETH2USB_AppState_t *app) {
 	DX_ETH2USB_App_UsbThreadState_t *threadState = &app->usbThreadState;
 	osStatus status = osOK;
 
-	status = osMessageQueuePut(app->usb2ethMsgQueueId, &threadState->frame, 0U,
-			osWaitForever);
+	status = osMessageQueuePut(app->responseMsgQueueId, &threadState->response, 0U,
+	osWaitForever);
 	if (status != osOK)
 		Error_Handler();
 
+	threadState->response = NULL;
 }
 
-/// The thread that forwards frames to the USB device.
 static void DX_ETH2USB_App_UsbThread(void *arg) {
 	DX_ETH2USB_AppState_t *app = arg;
 	DX_ETH2USB_App_UsbThreadState_t *threadState = &app->usbThreadState;
+	DX_ActiveServoClass_StatusTypeDef activeServoClassStatus =
+			DX__ACTIVE_SERVO_CLASS__OK;
 
 	while (true) {
-		while (!DX_USBH_IsDeviceConnected)
+		if (!DX_USBH_IsDeviceConnected) {
 			osDelay(50);
+			continue;
+		}
 
-		DX_ETH2USB_App_UsbThread_GetEthFrame(app);
-		mlog("Got new Ethernet frame with payload"
-				"of size %u to transmit to USB",
-				threadState->frame->payloadSize);
+		DX_ETH2USB_App_UsbThread_GetCommand(app);
 
-		DX_ETH2USB_App_UsbThread_PutEthFrame(app);
+		uint8_t *in = NULL;
+
+		if (!threadState->command->header.wrOnly) {
+			threadState->response = osMemoryPoolAlloc(app->responseMemPoolId, 0U);
+			if (threadState->response == NULL)
+				Error_Handler();
+
+			in = threadState->response->payload;
+		}
+
+		activeServoClassStatus = DX_ActiveServoClass_Cmd(&hUsbHostHS,
+				threadState->command->payload, in);
+		if (activeServoClassStatus != DX__ACTIVE_SERVO_CLASS__OK) {
+			mlog("Failed to command active servo");
+			return;
+		}
+
+		osMemoryPoolFree(app->commandMemPoolId, threadState->command);
+
+		if (!threadState->command->header.wrOnly) {
+			DX_ETH2USB_App_UsbThread_PutResponse(app);
+		}
 
 		osDelay(1);
 	}

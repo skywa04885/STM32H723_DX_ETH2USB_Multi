@@ -6,6 +6,9 @@
  */
 
 #include "dx/eth2usb/active_servo_class.h"
+#include "dx/eth2usb/active_servo_class_states/idle.h"
+#include "dx/eth2usb/active_servo_class_states/writing.h"
+#include "dx/eth2usb/active_servo_class_states/reading.h"
 #include "settings.h"
 #include "logging.h"
 
@@ -20,7 +23,7 @@ static USBH_StatusTypeDef DX_USB_ActiveServoClass_ClassRequest(
 static USBH_StatusTypeDef DX_USB_ActiveServoClass_SOFProcess(
 		USBH_HandleTypeDef *phost);
 
-USBH_ClassTypeDef DX_USB_ACTIVE_SERVO_CLASS = { .Name = "Active Servo",
+USBH_ClassTypeDef gDxActiveServoClass = { .Name = "Active Servo",
 		.ClassCode = DX_ETH2USB__USB_DEVICE__CLASS_CODE, .Init =
 				DX_USB_ActiveServoClass_InterfaceInit, .DeInit =
 				DX_USB_ActiveServoClass_InterfaceDeInit, .Requests =
@@ -43,10 +46,11 @@ static USBH_StatusTypeDef DX_USB_ActiveServoClass_InterfaceInit(
 	DX_ETH2USB__USB_DEVICE__INTERFACE__PROTOCOL_CODE);
 	if ((interfaceIndex == 0xFFU)
 			|| (interfaceIndex >= USBH_MAX_NUM_INTERFACES)) {
-		USBH_DbgLog("Cannot Find the interface for %s class.",
+		mlog("Cannot Find the interface for %s class.",
 				phost->pActiveClass->Name);
 		return USBH_FAIL;
 	}
+	mlog("Found interface %d for class", interfaceIndex);
 
 	// Gets the specific interface from the index.
 	interface = &phost->device.CfgDesc.Itf_Desc[interfaceIndex];
@@ -54,27 +58,30 @@ static USBH_StatusTypeDef DX_USB_ActiveServoClass_InterfaceInit(
 	// Selects the interface.
 	status = USBH_SelectInterface(phost, interfaceIndex);
 	if (status != USBH_OK) {
-		USBH_DbgLog("Failed to select interface");
+		mlog("Failed to select interface");
 		return USBH_FAIL;
 	}
+	mlog("Selected interface %d", interfaceIndex);
 
 	// Makes sure that the third end-point is of type input.
 	if (!(interface->Ep_Desc[2U].bEndpointAddress & 0x80U)) {
-		USBH_DbgLog("Third end-point of the interface is not of type IN");
+		mlog("Third end-point of the interface is not of type IN");
 		return USBH_FAIL;
 	}
+	mlog("Third end-point is of type IN and has address %02x", interface->Ep_Desc[2U].bEndpointAddress);
 
 	// Makes sure that the fourth end-point is of type output.
 	if (interface->Ep_Desc[3U].bEndpointAddress & 0x80U) {
-		USBH_DbgLog("Fourth end-point of the interface is not of type OUT");
+		mlog("Fourth end-point of the interface is not of type OUT");
 	}
+	mlog("Fourth end-point is of type OUT and has address %02x", interface->Ep_Desc[3U].bEndpointAddress);
 
 	// Allocates the memory needed for the handle.
 	phost->pActiveClass->pData = USBH_malloc(
 			sizeof(DX_ActiveServoClass_HandleTypeDef));
 	handle = (DX_ActiveServoClass_HandleTypeDef*) phost->pActiveClass->pData;
 	if (handle == NULL) {
-		USBH_DbgLog("Failed to allocate memory for ActiveServoClass handle");
+		mlog("Failed to allocate memory for ActiveServoClass handle");
 		return USBH_FAIL;
 	}
 
@@ -99,28 +106,32 @@ static USBH_StatusTypeDef DX_USB_ActiveServoClass_InterfaceInit(
 			phost->device.address, phost->device.speed,
 			USB_EP_TYPE_BULK, handle->outEpMaxPktSize);
 	if (status != USBH_OK) {
-		USBH_DbgLog("Failed to open output pipe");
+		mlog("Failed to open output pipe");
 		return USBH_FAIL;
 	}
+	mlog("Created IN pipe with address %02x on end-point with address %02x", handle->inPipeNo,
+			handle->inEpAddr);
 
 	// Opens the input pipe.
 	status = USBH_OpenPipe(phost, handle->inPipeNo, handle->inEpAddr,
 			phost->device.address, phost->device.speed,
 			USB_EP_TYPE_BULK, handle->inEpMaxPktSize);
 	if (status != USBH_OK) {
-		USBH_DbgLog("Failed to open input pipe");
+		mlog("Failed to open input pipe");
 		return USBH_FAIL;
 	}
+	mlog("Created OUT pipe with address %02x on end-point with address %02x", handle->outPipeNo,
+			handle->outEpAddr);
 
 	// Sets the toggle for the input and output pipes (I have no clue why we need to set this).
 	//  I'm basically basing everything on the USBH_MSC class code.
-	USBH_LL_SetToggle(phost, handle->inPipeNo, 0U);
+	USBH_LL_SetToggle(phost, handle->inPipeNo, 1U);
 	USBH_LL_SetToggle(phost, handle->outPipeNo, 0U);
 
 	// Creates the availability mutex.
 	handle->availabilityMutexId = osMutexNew(NULL);
 	if (handle->availabilityMutexId == NULL) {
-		USBH_DbgLog("Failed to create availability mutex");
+		mlog("Failed to create availability mutex");
 		return USBH_FAIL;
 	}
 
@@ -128,7 +139,7 @@ static USBH_StatusTypeDef DX_USB_ActiveServoClass_InterfaceInit(
 	handle->cmdMsgQueueId = osMessageQueueNew(1U,
 			sizeof(DX_ActiveServoClass_Cmd_TypeDef), NULL);
 	if (handle->cmdMsgQueueId == NULL) {
-		USBH_DbgLog("Failed to create command message queue");
+		mlog("Failed to create command message queue");
 		return USBH_FAIL;
 	}
 
@@ -136,12 +147,13 @@ static USBH_StatusTypeDef DX_USB_ActiveServoClass_InterfaceInit(
 	handle->rspMsgQueueId = osMessageQueueNew(1U,
 			sizeof(DX_ActiveServoClass_Rsp_TypeDef), NULL);
 	if (handle->rspMsgQueueId == NULL) {
-		USBH_DbgLog("Failed to create response message queue");
+		mlog("Failed to create response message queue");
 		return USBH_FAIL;
 	}
 
-	// Initializes the state machine to the idle state.
-	handle->state = DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__IDLE;
+	// Sets started to false, to let the state machine know
+	//  it should still start.
+	handle->started = false;
 
 	// I think the setup was okay?
 	return USBH_OK;
@@ -163,13 +175,13 @@ static USBH_StatusTypeDef DX_USB_ActiveServoClass_InterfaceDeInit(
 	if ((handle->outPipeNo) != 0U) {
 		status = USBH_ClosePipe(phost, handle->outPipeNo);
 		if (status != USBH_OK) {
-			USBH_DbgLog("Failed to close output pipe");
+			mlog("Failed to close output pipe");
 			return USBH_FAIL;
 		}
 
 		status = USBH_FreePipe(phost, handle->outPipeNo);
 		if (status != USBH_OK) {
-			USBH_DbgLog("Failed to free output pipe");
+			mlog("Failed to free output pipe");
 			return USBH_FAIL;
 		}
 
@@ -180,13 +192,13 @@ static USBH_StatusTypeDef DX_USB_ActiveServoClass_InterfaceDeInit(
 	if ((handle->inPipeNo) != 0U) {
 		status = USBH_ClosePipe(phost, handle->inPipeNo);
 		if (status != USBH_OK) {
-			USBH_DbgLog("Failed to close input pipe");
+			mlog("Failed to close input pipe");
 			return USBH_FAIL;
 		}
 
 		status = USBH_FreePipe(phost, handle->inPipeNo);
 		if (status != USBH_OK) {
-			USBH_DbgLog("Failed to free input pipe");
+			mlog("Failed to free input pipe");
 			return USBH_FAIL;
 		}
 
@@ -197,7 +209,7 @@ static USBH_StatusTypeDef DX_USB_ActiveServoClass_InterfaceDeInit(
 	if (handle->availabilityMutexId != NULL) {
 		osStatus = osMutexDelete(handle->availabilityMutexId);
 		if (osStatus != osOK) {
-			USBH_DbgLog("Failed to free the availability mutex");
+			mlog("Failed to free the availability mutex");
 			return USBH_FAIL;
 		}
 	}
@@ -206,7 +218,7 @@ static USBH_StatusTypeDef DX_USB_ActiveServoClass_InterfaceDeInit(
 	if (handle->cmdMsgQueueId != NULL) {
 		osStatus = osMessageQueueDelete(handle->cmdMsgQueueId);
 		if (osStatus != osOK) {
-			USBH_DbgLog("Failed to free command message queue");
+			mlog("Failed to free command message queue");
 			return USBH_FAIL;
 		}
 	}
@@ -215,7 +227,7 @@ static USBH_StatusTypeDef DX_USB_ActiveServoClass_InterfaceDeInit(
 	if (handle->rspMsgQueueId != NULL) {
 		osStatus = osMessageQueueDelete(handle->rspMsgQueueId);
 		if (osStatus != osOK) {
-			USBH_DbgLog("Failed to free response message queue");
+			mlog("Failed to free response message queue");
 			return USBH_FAIL;
 		}
 	}
@@ -227,63 +239,126 @@ static USBH_StatusTypeDef DX_USB_ActiveServoClass_InterfaceDeInit(
 	return USBH_OK;
 }
 
-static USBH_StatusTypeDef DX_USB_ActiveServoClass_Process_Idle(
-		USBH_HandleTypeDef *phost) {
+//static USBH_StatusTypeDef DX_USB_ActiveServoClass_Process_Idle(
+//		USBH_HandleTypeDef *phost) {
+
+//}
+
+static USBH_StatusTypeDef DX_USB_ActiveServoClass_Process_PerformCurrentEntry(USBH_HandleTypeDef *phost) {
 	DX_ActiveServoClass_HandleTypeDef *handle =
 			(DX_ActiveServoClass_HandleTypeDef*) phost->pActiveClass->pData;
-	osStatus_t osStatus = osOK;
-	USBH_StatusTypeDef usbhStatus = USBH_OK;
+	USBH_StatusTypeDef status = USBH_OK;
 
-	osStatus = osMessageQueueGet(handle->cmdMsgQueueId, &handle->cmd, 0U, 0U);
-	if (osStatus != osOK) {
-		if (osStatus == osErrorTimeout)
-			return;
-		USBH_DbgLog("Failed to get command from the command message queue");
-		return USBH_FAIL;
+	switch (handle->state) {
+	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__IDLE:
+		status = DX_USB_ActiveServoClass_IdleState_Entry(phost);
+		break;
+	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__WRITING:
+		status = DX_USB_ActiveServoClass_WritingState_Entry(phost);
+		break;
+	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__READING:
+		status = DX_USB_ActiveServoClass_ReadingState_Entry(phost);
+		break;
+	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__ERROR:
+		break;
 	}
 
-	usbhStatus = USBH_BulkSendData(phost, handle->cmd.out,
-			handle->cmd.outLength, handle->outPipeNo, 0U);
-	if (usbhStatus != USBH_OK) {
-		USBH_DbgLog("Failed to send bulk data");
-		// TODO: somehow inform the client of this failure.
-		return USBH_FAIL;
-	}
-
-	handle->state = DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__WRITING;
-
-	return USBH_OK;
+	return status;
 }
 
-static USBH_StatusTypeDef DX_USB_ActiveServoClass_Process_Writing(
-		USBH_HandleTypeDef *phost) {
+static USBH_StatusTypeDef DX_USB_ActiveServoClass_Process_PerformCurrentDo(USBH_HandleTypeDef *phost) {
 	DX_ActiveServoClass_HandleTypeDef *handle =
 			(DX_ActiveServoClass_HandleTypeDef*) phost->pActiveClass->pData;
+	USBH_StatusTypeDef status = USBH_OK;
 
-	return USBH_OK;
+	switch (handle->state) {
+	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__IDLE:
+		status = DX_USB_ActiveServoClass_IdleState_Do(phost);
+		break;
+	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__WRITING:
+		status = DX_USB_ActiveServoClass_WritingState_Do(phost);
+		break;
+	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__READING:
+		status = DX_USB_ActiveServoClass_ReadingState_Do(phost);
+		break;
+	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__ERROR:
+		break;
+	}
+
+	return status;
+}
+
+static USBH_StatusTypeDef DX_USB_ActiveServoClass_Process_PerformCurrentExit(USBH_HandleTypeDef *phost) {
+	DX_ActiveServoClass_HandleTypeDef *handle =
+			(DX_ActiveServoClass_HandleTypeDef*) phost->pActiveClass->pData;
+	USBH_StatusTypeDef status = USBH_OK;
+
+	switch (handle->state) {
+	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__IDLE:
+		status = DX_USB_ActiveServoClass_IdleState_Exit(phost);
+		break;
+	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__WRITING:
+		status = DX_USB_ActiveServoClass_WritingState_Exit(phost);
+		break;
+	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__READING:
+		status = DX_USB_ActiveServoClass_ReadingState_Exit(phost);
+		break;
+	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__ERROR:
+		break;
+	}
+
+	return status;
+}
+
+static USBH_StatusTypeDef DX_USB_ActiveServoClass_Process_PerformStateTransition(USBH_HandleTypeDef *phost) {
+	DX_ActiveServoClass_HandleTypeDef *handle =
+			(DX_ActiveServoClass_HandleTypeDef*) phost->pActiveClass->pData;
+	USBH_StatusTypeDef status = USBH_OK;
+
+	if (handle->nextState == handle->state)
+		return status;
+
+	status = DX_USB_ActiveServoClass_Process_PerformCurrentExit(phost);
+	if (status != USBH_OK)
+		return status;
+
+	handle->state = handle->nextState;
+
+	status = DX_USB_ActiveServoClass_Process_PerformCurrentEntry(phost);
+	if (status != USBH_OK)
+		return status;
+
+	return status;
 }
 
 static USBH_StatusTypeDef DX_USB_ActiveServoClass_Process(
 		USBH_HandleTypeDef *phost) {
 	DX_ActiveServoClass_HandleTypeDef *handle =
 			(DX_ActiveServoClass_HandleTypeDef*) phost->pActiveClass->pData;
+
 	USBH_StatusTypeDef status = USBH_OK;
 
-	switch (handle->state) {
-	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__IDLE: {
-		status = DX_USB_ActiveServoClass_Process_Idle(phost);
-		break;
+	// Starts the state machine if needed.
+	if (!handle->started) {
+		mlog("Starting state machine");
+
+		handle->state = handle->nextState = DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__IDLE;
+		handle->started = true;
+
+		status = DX_USB_ActiveServoClass_Process_PerformCurrentEntry(phost);
+
+		return status;
 	}
-	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__WRITING: {
-		status = DX_USB_ActiveServoClass_Process_Writing(phost);
-		break;
-	}
-	case DX__ETH2USB__ACTIVE_SERVO_CLASS_STATE__READING: {
-		break;
-	}
-	default:
-		break;
-	}
+
+	// Performs the state transition if needed.
+	status = DX_USB_ActiveServoClass_Process_PerformStateTransition(phost);
+	if (status != USBH_OK)
+		return status;
+
+	// Performs the do of the current state.
+	status = DX_USB_ActiveServoClass_Process_PerformCurrentDo(phost);
+	if (status != USBH_OK)
+		return status;
 
 	return status;
 }
@@ -300,8 +375,7 @@ static USBH_StatusTypeDef DX_USB_ActiveServoClass_SOFProcess(
 }
 
 DX_ActiveServoClass_StatusTypeDef DX_ActiveServoClass_Cmd(
-		USBH_HandleTypeDef *phost, uint8_t *out, uint16_t outLength, uint8_t in,
-		uint16_t inLength) {
+		USBH_HandleTypeDef *phost, uint8_t *out, uint8_t *in) {
 	DX_ActiveServoClass_HandleTypeDef *handle =
 			(DX_ActiveServoClass_HandleTypeDef*) phost->pActiveClass->pData;
 	DX_ActiveServoClass_Cmd_TypeDef cmd;
@@ -309,27 +383,38 @@ DX_ActiveServoClass_StatusTypeDef DX_ActiveServoClass_Cmd(
 	osStatus_t osStatus = osOK;
 
 	cmd.out = out;
-	cmd.outLength = outLength;
+	cmd.in = in;
 
+	mlog("Acquiring availability mutex");
 	osStatus = osMutexAcquire(handle->availabilityMutexId, osWaitForever);
 	if (osStatus != osOK) {
 		USBH_DbgLog("Failed to acquire the availability mutex");
 		return DX__ACTIVE_SERVO_CLASS__ERR;
 	}
+	mlog("Acquired availability mutex");
 
+	mlog("Putting command in message queue");
 	osStatus = osMessageQueuePut(handle->cmdMsgQueueId, &cmd, 0U,
 			osWaitForever);
 	if (osStatus != osOK) {
 		USBH_DbgLog("Failed to put command inside message queue");
 		return DX__ACTIVE_SERVO_CLASS__ERR;
 	}
+	mlog("Put command in message queue");
 
+		while (osMessageQueueGetCount(handle->rspMsgQueueId) == 0) {
+		  phost->os_msg = (uint32_t)USBH_CLASS_EVENT;
+		  (void)osMessageQueuePut(phost->os_event, &phost->os_msg, 0U, 0U);
+		}
+
+	mlog("Waiting for response");
 	osStatus = osMessageQueueGet(handle->rspMsgQueueId, &rsp, 0U,
 			osWaitForever);
 	if (osStatus != osOK) {
 		USBH_DbgLog("Failed to get response from message queue");
 		return DX__ACTIVE_SERVO_CLASS__ERR;
 	}
+	mlog("Received response");
 
 	osStatus = osMutexRelease(handle->availabilityMutexId);
 	if (osStatus != osOK) {

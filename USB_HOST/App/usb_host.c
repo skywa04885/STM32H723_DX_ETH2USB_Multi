@@ -32,6 +32,7 @@
 #include <stdbool.h>
 #include "settings.h"
 #include "logging.h"
+#include "dx/eth2usb/active_servo_class.h"
 /* USER CODE END Includes */
 
 /* USER CODE BEGIN PV */
@@ -82,13 +83,6 @@ static void USBH_UserProcess_HandleConnect(USBH_HandleTypeDef *phost) {
 	if (DX_USBH_IsDeviceConnected)
 		return;
 
-//#ifdef DX_ETH2USB__USB_DEVICE__VALIDATE_VENDOR_ID_AND_PRODUCT_ID
-//	if (!USBH_UserProcess_HandleConnect_IsDeviceValid(phost))
-//		return;
-//#endif
-
-//	USBH_UserProcess_HandleConnect_OpenPipes(phost);
-
 	DX_USBH_IsDeviceConnected = true;
 
 }
@@ -101,7 +95,6 @@ static void USBH_UserProcess_HandleConnect(USBH_HandleTypeDef *phost) {
 void MX_USB_HOST_Init(void)
 {
   /* USER CODE BEGIN USB_HOST_Init_PreTreatment */
-
   /* USER CODE END USB_HOST_Init_PreTreatment */
 
   /* Init host Library, add supported class and start the library. */
@@ -109,32 +102,14 @@ void MX_USB_HOST_Init(void)
   {
     Error_Handler();
   }
-  if (USBH_RegisterClass(&hUsbHostHS, USBH_AUDIO_CLASS) != USBH_OK)
-  {
-    Error_Handler();
-  }
-  if (USBH_RegisterClass(&hUsbHostHS, USBH_CDC_CLASS) != USBH_OK)
-  {
-    Error_Handler();
-  }
-  if (USBH_RegisterClass(&hUsbHostHS, USBH_MSC_CLASS) != USBH_OK)
-  {
-    Error_Handler();
-  }
-  if (USBH_RegisterClass(&hUsbHostHS, USBH_HID_CLASS) != USBH_OK)
-  {
-    Error_Handler();
-  }
-  if (USBH_RegisterClass(&hUsbHostHS, USBH_MTP_CLASS) != USBH_OK)
-  {
-    Error_Handler();
+  if (USBH_RegisterClass(&hUsbHostHS, DX_ACTIVE_SERVO_CLASS) != USBH_OK) {
+	  Error_Handler();
   }
   if (USBH_Start(&hUsbHostHS) != USBH_OK)
   {
     Error_Handler();
   }
   /* USER CODE BEGIN USB_HOST_Init_PostTreatment */
-
   /* USER CODE END USB_HOST_Init_PostTreatment */
 }
 
@@ -147,9 +122,6 @@ static void USBH_UserProcess  (USBH_HandleTypeDef *phost, uint8_t id)
 
 	switch (id) {
 	case HOST_USER_SELECT_CONFIGURATION:
-
-		// For some reason it crashes if we don't do it in the select configuration.
-//		USBH_UserProcess_SelectConfig_PrintInfo(phost);
 
 		break;
 

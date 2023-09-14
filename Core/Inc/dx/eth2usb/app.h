@@ -12,19 +12,10 @@
 #include <stdbool.h>
 #include <cmsis_os.h>
 #include <sys/socket.h>
-#include "dx/eth2usb/eth_frame.h"
 
-#ifndef DX_ETH2USB_APP_ETH_FRAME_MEM_POOL_SIZE
-#define DX_ETH2USB_APP_ETH_FRAME_MEM_POOL_SIZE 20
-#endif
-
-#ifndef DX_ETH2USB_APP_ETH2USB_MSG_QUEUE_SIZE
-#define DX_ETH2USB_APP_ETH2USB_MSG_QUEUE_SIZE 10
-#endif
-
-#ifndef DX_ETH2USB_APP_USB2ETH_MSG_QUEUE_SIZE
-#define DX_ETH2USB_APP_USB2ETH_MSG_QUEUE_SIZE 10
-#endif
+#include "dx/eth2usb/command.h"
+#include "dx/eth2usb/response.h"
+#include "settings.h"
 
 typedef struct {
 	int32_t fd;
@@ -43,8 +34,8 @@ typedef struct {
 	DX_ETH2USB_App_EthThread_ServerState_t server;
 	DX_ETH2USB_App_EthThread_ClientState_t client;
 	// Frames.
-	DX_ETH2USB_ETHFrame_t *incommingFrame;
-	DX_ETH2USB_ETHFrame_t *outgoingFrame;
+	DX_ETH2USB_Command_t *command;
+	DX_ETH2USB_Response_t *response;
 	// Frame writing.
 	uint32_t nBytesWritten;
 	uint32_t nBytesRead;
@@ -58,15 +49,17 @@ typedef struct {
 } DX_ETH2USB_App_StatusThreadState_t;
 
 typedef struct {
-	DX_ETH2USB_ETHFrame_t *frame;
+	DX_ETH2USB_Command_t *command;
+	DX_ETH2USB_Response_t *response;
 } DX_ETH2USB_App_UsbThreadState_t;
 
 typedef struct {
 	// Memory pool identifiers.
-	osMemoryPoolId_t ethFrameMemPoolId;
+	osMemoryPoolId_t commandMemPoolId;
+	osMemoryPoolId_t responseMemPoolId;
 	// Message queues.
-	osMessageQueueId_t eth2usbMsgQueueId;
-	osMessageQueueId_t usb2ethMsgQueueId;
+	osMessageQueueId_t responseMsgQueueId;
+	osMessageQueueId_t commandMsgQueueId;
 	// Thread attributes.
 	osThreadAttr_t ethThreadAttr;
 	osThreadAttr_t usbThreadAttr;
